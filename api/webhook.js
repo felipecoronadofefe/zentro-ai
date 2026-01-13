@@ -1,90 +1,129 @@
 export default async function handler(req, res) {
   try {
+    // Permite testar no navegador
     if (req.method === "GET") {
       return res.status(200).json({ ok: true, message: "Webhook online. Use POST." });
     }
-    if (req.method !== "POST") return res.status(405).json({ ok: false });
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+    }
 
+    // ===== ENV VARS (Vercel) =====
     const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID || "";
     const ZAPI_INSTANCE_TOKEN = process.env.ZAPI_INSTANCE_TOKEN || "";
     const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || "";
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+    const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
     const missing = {
       hasInstance: !!ZAPI_INSTANCE_ID,
       hasToken: !!ZAPI_INSTANCE_TOKEN,
       hasClientToken: !!ZAPI_CLIENT_TOKEN,
+      hasOpenAIKey: !!OPENAI_API_KEY,
     };
 
-    if (!missing.hasInstance || !missing.hasToken || !missing.hasClientToken) {
+    if (!missing.hasInstance || !missing.hasToken || !missing.hasClientToken || !missing.hasOpenAIKey) {
       console.log("VARIAVEIS_AUSENTES", missing);
-      return res.status(500).json({ ok: false, error: "Variáveis ausentes", missing });
+      return res.status(500).json({ ok: false, error: "Variáveis de ambiente ausentes", missing });
     }
 
-    const body = req.body || {};
-    console.log("WEBHOOK_RECEBIDO_KEYS", Object.keys(body));
+    // ===== BODY =====
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
     console.log("WEBHOOK_RECEBIDO", body);
 
-    // ✅ Ignora só mensagens ENVIADAS POR VOCÊ (pra não entrar em loop)
-    const fromMe =
-      body.fromMe === true ||
-      body.sentByMe === true ||
-      body.isSentByMe === true ||
-      body?.message?.fromMe === true;
+    // ===== FILTROS ANTI-LOOP =====
+    // (1) Ignora mensagens enviadas por você mesmo / status / grupo
+    if (body?.fromMe === true) return res.status(200).json({ ok: true, ignored: "fromMe" });
+    if (body?.isStatusReply === true) return res.status(200).json({ ok: true, ignored: "isStatusReply" });
+    if (body?.isGroup === true) return res.status(200).json({ ok: true, ignored: "isGroup" });
 
-    if (fromMe) {
-      console.log("IGNORADO_FROM_ME");
-      return res.status(200).json({ skipped: true, reason: "fromMe" });
-    }
-
-    // ✅ Pega texto (vários formatos)
-    const rawText =
-      (typeof body?.text?.message === "string" && body.text.message) ||
-      (typeof body?.message?.text === "string" && body.message.text) ||
-      (typeof body?.message === "string" && body.message) ||
+    // ===== EXTRAI TEXTO =====
+    const text =
+      body?.text?.message ??
+      body?.message?.text ??
+      body?.message ??
+      body?.body ??
       "";
 
-    const text = String(rawText || "").trim();
+    const incomingText = (typeof text === "string" ? text : "").trim();
+    if (!incomingText) return res.status(200).json({ ok: true, ignored: "empty_text" });
 
-    // ✅ Pega phone/chatId (vários formatos)
+    // Se chegar algo que comece com "Recebi:", ignora (extra segurança)
+    if (incomingText.toLowerCase().startsWith("recebi:")) {
+      return res.status(200).json({ ok: true, ignored: "echo_protection" });
+    }
+
+    // ===== EXTRAI PHONE =====
     const phone =
-      body.phone ||
-      body.connectedPhone ||
-      body?.message?.phone ||
-      body.chatId || // no seu print vinha chatId
+      body?.phone ??
+      body?.connectedPhone ??
+      body?.chatId ??
       "";
 
-    if (!phone || !text) {
-      console.log("IGNORADO_SEM_PHONE_OU_TEXTO", { phone: !!phone, text: !!text });
-      return res.status(200).json({ skipped: true, reason: "missing phone/text" });
+    const toPhone = (typeof phone === "string" ? phone : "").trim();
+    if (!toPhone) {
+      console.log("PHONE_VAZIO", { phone, bodyKeys: Object.keys(body || {}) });
+      return res.status(200).json({ ok: true, ignored: "phone_empty" });
     }
 
-    // ✅ Trava extra: evita eco infinito caso volte "Recebi:"
-    if (text.toLowerCase().startsWith("recebi:")) {
-      console.log("IGNORADO_JA_ECOU");
-      return res.status(200).json({ skipped: true, reason: "already echoed" });
+    // ===== CHAMA OPENAI (ChatGPT) =====
+    // Exemplo oficial de autenticação Bearer e /v1/chat/completions.  [oai_citation:0‡OpenAI Platform](https://platform.openai.com/docs/guides/latest-model?utm_source=chatgpt.com)
+    const systemPrompt =
+      "Você é a Zentro AI. Responda em português do Brasil, de forma curta, direta e útil. No máximo 2 frases.";
+
+    const openaiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: incomingText },
+        ],
+        // pode remover se quiser
+        verbosity: "low",
+      }),
+    });
+
+    const openaiJson = await openaiResp.json();
+    if (!openaiResp.ok) {
+      console.log("OPENAI_ERRO", openaiJson);
+      return res.status(500).json({ ok: false, error: "Erro OpenAI", details: openaiJson });
     }
 
-    const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_INSTANCE_TOKEN}/send-text`;
+    const aiText =
+      openaiJson?.choices?.[0]?.message?.content?.trim() ||
+      "Não consegui gerar resposta agora.";
 
-    const response = await fetch(url, {
+    // ===== ENVIA RESPOSTA PELA Z-API =====
+    const zapiUrl = `https://api.z-api.io/instances/${encodeURIComponent(
+      ZAPI_INSTANCE_ID
+    )}/token/${encodeURIComponent(ZAPI_INSTANCE_TOKEN)}/send-text?phone=${encodeURIComponent(toPhone)}`;
+
+    const zapiResp = await fetch(zapiUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Client-Token": ZAPI_CLIENT_TOKEN,
       },
       body: JSON.stringify({
-        phone,
-        message: `Recebi: ${text}`,
+        phone: toPhone,
+        message: aiText,
       }),
     });
 
-    const data = await response.json();
-    console.log("ZAPI_RESPONSE_STATUS", response.status);
-    console.log("ZAPI_RESPONSE", data);
+    const zapiJson = await zapiResp.json().catch(() => ({}));
+    if (!zapiResp.ok) {
+      console.log("ZAPI_ERRO", zapiJson);
+      return res.status(500).json({ ok: false, error: "Erro Z-API", details: zapiJson });
+    }
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true, received: incomingText, reply: aiText });
   } catch (err) {
-    console.error("ERRO_FATAL", err);
-    return res.status(500).json({ error: "Crash interno" });
+    console.log("ERRO_GERAL", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
