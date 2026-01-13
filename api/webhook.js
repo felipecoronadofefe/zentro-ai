@@ -1,94 +1,84 @@
+// api/webhook.js
+
 export default async function handler(req, res) {
+  // Aceita só POST
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  // Lê variáveis de ambiente
+  const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE || "";
+  const ZAPI_TOKEN = process.env.ZAPI_TOKEN || "";
+  const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || "";
+
+  const hasInstance = Boolean(ZAPI_INSTANCE.trim());
+  const hasToken = Boolean(ZAPI_TOKEN.trim());
+  const hasClientToken = Boolean(ZAPI_CLIENT_TOKEN.trim());
+
+  // Se faltar env, já avisa no log e retorna 200 (pra Z-API não ficar reenviando)
+  if (!hasInstance || !hasToken || !hasClientToken) {
+    console.log("VARIAVEIS_AUSENTES", { hasInstance, hasToken, hasClientToken });
+    return res.status(200).json({ ok: false, error: "missing_env" });
+  }
+
+  // Body do webhook
+  const body = req.body || {};
+  console.log("WEBHOOK_RECEBIDO", body);
+
+  // Tenta achar o texto
+  const text =
+    (body?.text?.message ?? body?.message ?? body?.body ?? body?.text ?? "")
+      .toString()
+      .trim();
+
+  // Tenta achar o telefone
+  // Prioridade: body.phone -> body.chatId (extrai dígitos)
+  let phone = (body?.phone ?? "").toString().trim();
+
+  if (!phone) {
+    const chatId = (body?.chatId ?? "").toString();
+    // extrai somente números do chatId
+    phone = chatId.replace(/\D/g, "");
+  }
+
+  // Se ainda não tem phone, só encerra (não tenta enviar)
+  if (!phone) {
+    console.log("PHONE_AUSENTE");
+    return res.status(200).json({ ok: true, skipped: "no_phone" });
+  }
+
+  // Se não tem texto (ex: evento de status), não responde
+  if (!text) {
+    console.log("SEM_TEXTO (ignorado)");
+    return res.status(200).json({ ok: true, skipped: "no_text" });
+  }
+
+  // Monta resposta simples
+  const reply = `Recebi: ${text}`;
+
+  // Endpoint oficial send-text (padrão Z-API)
+  const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}/send-text`;
+
   try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed" });
-    }
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Client-Token": ZAPI_CLIENT_TOKEN,
+      },
+      body: JSON.stringify({
+        phone,
+        message: reply,
+      }),
+    });
 
-    const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;
-    const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
-    const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
+    const data = await resp.json().catch(() => ({}));
+    console.log("RESPOSTA_ZAPI_STATUS", resp.status);
+    console.log("RESPOSTA_ZAPI_BODY", data);
 
-    if (!ZAPI_INSTANCE || !ZAPI_TOKEN || !ZAPI_CLIENT_TOKEN) {
-      console.error("VARIAVEIS_AUSENTES", {
-        hasInstance: !!ZAPI_INSTANCE,
-        hasToken: !!ZAPI_TOKEN,
-        hasClientToken: !!ZAPI_CLIENT_TOKEN,
-      });
-      return res.status(500).json({ error: "Env vars missing" });
-    }
-
-    // ✅ garantir parse do body (às vezes vem string)
-    const data = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-    console.log("WEBHOOK_RECEBIDO_KEYS:", Object.keys(data || {}));
-    console.log("WEBHOOK_RECEBIDO_RAW:", JSON.stringify(data));
-
-    // ignorar status
-    if (data?.isStatusReply) {
-      return res.status(200).json({ ok: true });
-    }
-
-    // texto (bem tolerante)
-    const text =
-      data?.text?.message ??
-      data?.message?.text ??
-      data?.message?.body ??
-      data?.messages?.[0]?.text ??
-      data?.messages?.[0]?.body ??
-      "";
-
-    // 🔎 achar chatId em vários lugares possíveis
-    const chatId =
-      data?.chatId ??
-      data?.message?.chatId ??
-      data?.messages?.[0]?.chatId ??
-      data?.data?.chatId ??
-      "";
-
-    // ✅ transformar chatId em phone (remove sufixos)
-    let phone = "";
-    if (typeof chatId === "string" && chatId.length > 0) {
-      phone = chatId
-        .replace("@id", "")
-        .replace("@c.us", "")
-        .replace("@g.us", "")
-        .replace(/\D/g, ""); // deixa só números
-    }
-
-    console.log("DEBUG_TEXT:", text);
-    console.log("DEBUG_CHATID:", chatId);
-    console.log("DEBUG_PHONE:", phone);
-
-    if (!phone) {
-      console.error("PHONE_EMPTY_DETECTED");
-      // responde 200 pra não ficar re-tentando sem parar
-      return res.status(200).json({ error: "Phone empty (not found in payload)" });
-    }
-
-    const replyText = "Oi! 👋 Recebi sua mensagem com sucesso.";
-
-    const response = await fetch(
-      `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}/send-text`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Client-Token": ZAPI_CLIENT_TOKEN,
-        },
-        body: JSON.stringify({
-          phone,
-          message: replyText,
-        }),
-      }
-    );
-
-    const result = await response.json();
-    console.log("RESPOSTA_ZAPI_STATUS:", response.status);
-    console.log("RESPOSTA_ZAPI_BODY:", result);
-
-    return res.status(200).json({ success: true });
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("ERRO_GERAL:", err);
-    return res.status(500).json({ error: "Internal error" });
+    console.log("ERRO_FETCH_ZAPI", err?.message || err);
+    return res.status(200).json({ ok: false, error: "fetch_failed" });
   }
 }
