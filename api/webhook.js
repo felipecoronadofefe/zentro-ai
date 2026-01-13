@@ -1,64 +1,70 @@
 export default async function handler(req, res) {
   try {
-    // Aceita apenas POST
+    // Só aceita POST
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
 
-    const body = req.body || {};
-    console.log("WEBHOOK RECEBIDO:", JSON.stringify(body));
+    const data = req.body;
 
-    // 🔹 Extrair texto de forma SEGURA (Z-API manda vários formatos)
-    let text = "";
+    console.log("WEBHOOK RECEBIDO:", JSON.stringify(data, null, 2));
 
-    if (
-      body.message &&
-      body.message.text &&
-      typeof body.message.text === "string"
-    ) {
-      text = body.message.text.trim();
+    // Ignora status e mensagens enviadas por você
+    if (data.isStatusReply === true || data.fromMe === true) {
+      return res.status(200).json({ ok: true, ignored: true });
     }
 
-    // Se não for mensagem de texto, ignora
-    if (!text) {
-      return res.status(200).json({ status: "ignored (no text)" });
+    // Extrai texto corretamente (Z-API envia como objeto)
+    let messageText = "";
+
+    if (data.text && typeof data.text === "object") {
+      messageText = data.text.message || "";
     }
 
-    // 🔹 Dados do chat
-    const chatId =
-      body.chatId ||
-      body.chat?.id ||
-      body.message?.chatId;
+    messageText = messageText.toString().trim();
 
-    if (!chatId) {
-      return res.status(200).json({ status: "ignored (no chatId)" });
+    if (!messageText) {
+      return res.status(200).json({ ok: true, empty: true });
     }
 
-    console.log("TEXTO RECEBIDO:", text);
-    console.log("CHAT ID:", chatId);
+    const chatId = data.chatId;
 
-    // 🔹 Enviar resposta via Z-API
-    const response = await fetch(
-      `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_INSTANCE_TOKEN}/send-text`,
+    // ENV VARS (Vercel)
+    const INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
+    const INSTANCE_TOKEN = process.env.ZAPI_INSTANCE_TOKEN;
+    const CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
+
+    if (!INSTANCE_ID || !INSTANCE_TOKEN || !CLIENT_TOKEN) {
+      console.error("Variáveis de ambiente ausentes");
+      return res.status(500).json({ error: "Missing env vars" });
+    }
+
+    // Resposta automática simples
+    const responseText = `Recebi sua mensagem: "${messageText}"`;
+
+    const zapiResponse = await fetch(
+      `https://api.z-api.io/instances/${INSTANCE_ID}/token/${INSTANCE_TOKEN}/send-text`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Client-Token": process.env.ZAPI_CLIENT_TOKEN,
+          "Client-Token": CLIENT_TOKEN
         },
         body: JSON.stringify({
           phone: chatId,
-          message: `Você disse: ${text}`,
-        }),
+          message: responseText
+        })
       }
     );
 
-    const result = await response.json();
-    console.log("RESPOSTA Z-API:", result);
+    const zapiResult = await zapiResponse.json();
 
-    return res.status(200).json({ success: true });
-  } catch (error) {
-    console.error("ERRO GERAL:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    console.log("RESPOSTA Z-API:", zapiResult);
+
+    return res.status(200).json({ ok: true });
+
+  } catch (err) {
+    console.error("ERRO GERAL:", err);
+    return res.status(500).json({ error: "Internal error" });
   }
 }
