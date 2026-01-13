@@ -14,39 +14,29 @@ export default async function handler(req, res) {
       hasToken: !!ZAPI_INSTANCE_TOKEN,
       hasClientToken: !!ZAPI_CLIENT_TOKEN,
     };
+
     if (!missing.hasInstance || !missing.hasToken || !missing.hasClientToken) {
       console.log("VARIAVEIS_AUSENTES", missing);
       return res.status(500).json({ ok: false, error: "Variáveis ausentes", missing });
     }
 
     const body = req.body || {};
+    console.log("WEBHOOK_RECEBIDO_KEYS", Object.keys(body));
+    console.log("WEBHOOK_RECEBIDO", body);
 
-    // ✅ 1) Ignora mensagens de status/callbacks
-    if (body.isStatusReply === true || body.type === "ReceivedCallback") {
-      return res.status(200).json({ skipped: true, reason: "status/callback" });
-    }
-
-    // ✅ 2) Ignora mensagens ENVIADAS POR VOCÊ (evita loop)
-    // Em muitos payloads da Z-API isso vem como fromMe / fromAPI / sentByMe / isSentByMe
+    // ✅ Ignora só mensagens ENVIADAS POR VOCÊ (pra não entrar em loop)
     const fromMe =
       body.fromMe === true ||
-      body.fromAPI === true ||
       body.sentByMe === true ||
       body.isSentByMe === true ||
       body?.message?.fromMe === true;
 
     if (fromMe) {
+      console.log("IGNORADO_FROM_ME");
       return res.status(200).json({ skipped: true, reason: "fromMe" });
     }
 
-    // ✅ 3) Pega texto/telefone em vários formatos
-    const phone =
-      body.phone ||
-      body.connectedPhone ||
-      body?.message?.phone ||
-      body?.chatId ||
-      "";
-
+    // ✅ Pega texto (vários formatos)
     const rawText =
       (typeof body?.text?.message === "string" && body.text.message) ||
       (typeof body?.message?.text === "string" && body.message.text) ||
@@ -55,17 +45,25 @@ export default async function handler(req, res) {
 
     const text = String(rawText || "").trim();
 
-    // Se não tem texto ou não tem phone, não faz nada
+    // ✅ Pega phone/chatId (vários formatos)
+    const phone =
+      body.phone ||
+      body.connectedPhone ||
+      body?.message?.phone ||
+      body.chatId || // no seu print vinha chatId
+      "";
+
     if (!phone || !text) {
+      console.log("IGNORADO_SEM_PHONE_OU_TEXTO", { phone: !!phone, text: !!text });
       return res.status(200).json({ skipped: true, reason: "missing phone/text" });
     }
 
-    // ✅ 4) Trava extra: se já começa com "Recebi:" não responde de novo
+    // ✅ Trava extra: evita eco infinito caso volte "Recebi:"
     if (text.toLowerCase().startsWith("recebi:")) {
+      console.log("IGNORADO_JA_ECOU");
       return res.status(200).json({ skipped: true, reason: "already echoed" });
     }
 
-    // ✅ 5) Responde
     const url = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_INSTANCE_TOKEN}/send-text`;
 
     const response = await fetch(url, {
@@ -81,6 +79,7 @@ export default async function handler(req, res) {
     });
 
     const data = await response.json();
+    console.log("ZAPI_RESPONSE_STATUS", response.status);
     console.log("ZAPI_RESPONSE", data);
 
     return res.status(200).json({ ok: true });
